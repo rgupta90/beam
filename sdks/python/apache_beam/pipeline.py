@@ -249,6 +249,12 @@ class Pipeline(HasDisplayData):
     self.transforms_stack = [
         AppliedPTransform(None, None, '', None, None, None)
     ]
+    # Stack of type variable binding dicts pushed by each transform as it is
+    # applied.  Each entry maps TypeVar → concrete type derived by matching the
+    # transform's declared input type hint against the actual input element type.
+    # Inner transforms can inherit these bindings when they have no input type
+    # hint of their own, propagating K/V/T resolutions across composite scopes.
+    self._type_var_bindings_stack: list[dict] = []
     # Set of transform labels (full labels) applied to the pipeline.
     # If a transform is applied and the full label is already in the set
     # then the transform will have to be cloned with a new label.
@@ -811,7 +817,20 @@ class Pipeline(HasDisplayData):
 
       self._assert_not_applying_PDone(pvalueish, transform)
 
-      pvalueish_result = self.runner.apply(transform, pvalueish, self._options)
+      # Push type variable bindings derived from this transform's declared input
+      # type hint matched against the actual input element type.  Inner
+      # transforms applied during expand() will inherit these bindings via
+      # _get_ancestor_type_var_bindings() when they have no input hint of their
+      # own, allowing K/V/T to resolve correctly inside composite PTransforms.
+      _pushed_type_var_bindings = False
+      try:
+        self._type_var_bindings_stack.append(
+            self._compute_type_var_bindings(transform, inputs, type_options))
+        _pushed_type_var_bindings = True
+        pvalueish_result = self.runner.apply(transform, pvalueish, self._options)
+      finally:
+        if _pushed_type_var_bindings:
+          self._type_var_bindings_stack.pop()
 
       if type_options is not None and type_options.pipeline_type_check:
         transform.type_check_outputs(pvalueish_result)
@@ -877,6 +896,55 @@ class Pipeline(HasDisplayData):
     """
     unique_suffix = uuid.uuid4().hex[:6]
     return '%s_%s' % (transform.label, unique_suffix)
+
+  def _compute_type_var_bindings(
+      self,
+      transform: ptransform.PTransform,
+      inputs: dict,
+      type_options: TypeOptions) -> dict:
+    """Return type variable bindings for *transform* given its actual inputs.
+
+    Matches the transform's declared input type hint (e.g. ``Tuple[K, V]``)
+    against the concrete element type of the incoming PCollection
+    (e.g. ``Tuple[str, int]``) to produce a binding dict ``{K: str, V: int}``.
+
+    Returns an empty dict when:
+    - type checking is disabled,
+    - the transform has no ``with_input_types`` hint,
+    - the input element type is unknown (``Any``), or
+    - there are no PCollection inputs (e.g. a root source).
+    """
+    if type_options is None or not type_options.pipeline_type_check:
+      return {}
+    type_hints = transform.get_type_hints()
+    input_types = type_hints.input_types
+    if not input_types or not input_types[0]:
+      return {}
+    input_element_types = tuple(
+        i.element_type
+        for i in inputs.values()
+        if isinstance(i, pvalue.PCollection))
+    if not input_element_types:
+      return {}
+    input_element_type = (
+        input_element_types[0] if len(input_element_types) == 1 else
+        typehints.Union[input_element_types])
+    if not input_element_type or input_element_type == typehints.Any:
+      return {}
+    declared_input_type = input_types[0][0]
+    return typehints.match_type_variables(declared_input_type, input_element_type)
+
+  def _get_ancestor_type_var_bindings(self) -> dict:
+    """Return merged type variable bindings from all enclosing transform scopes.
+
+    Iterates ``_type_var_bindings_stack`` from outermost to innermost so that
+    inner scopes override outer ones when the same type variable appears in both
+    (inner composites have more specific information about their inputs).
+    """
+    merged: dict = {}
+    for bindings in self._type_var_bindings_stack:
+      merged.update(bindings)
+    return merged
 
   def _infer_result_type(
       self,
@@ -1006,7 +1074,20 @@ class Pipeline(HasDisplayData):
               typehints.match_type_variables(
                   declared_input_type, input_element_type))
         else:
-          result_element_type = declared_output_type
+          # No input type hint on this transform — try to resolve type variables
+          # using bindings inherited from enclosing composite scopes.  This is
+          # the core of the fix for GH#36775: a composite annotated with
+          # @with_input_types(Tuple[K, V]) pushes {K: str, V: int} onto
+          # _type_var_bindings_stack before calling expand(), so inner
+          # transforms that declare .with_output_types(Tuple[K, W]) but no
+          # .with_input_types() can still resolve K here instead of falling
+          # back to Any.
+          ancestor_bindings = self._get_ancestor_type_var_bindings()
+          if ancestor_bindings:
+            result_element_type = typehints.bind_type_variables(
+                declared_output_type, ancestor_bindings)
+          else:
+            result_element_type = declared_output_type
       else:
         result_element_type = transform.infer_output_type(input_element_type)
 

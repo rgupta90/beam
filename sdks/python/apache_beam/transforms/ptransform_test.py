@@ -1456,16 +1456,11 @@ class PTransformTypeCheckTestCase(TypeHintTestCase):
 
       self.assertEqual(result.element_type, typehints.Tuple[str, str])
 
-  def test_child_without_input_hints_fails_to_bind_typevars(self):
+  def test_child_without_input_hints_inherits_ancestor_bindings(self):
     """
-    When a child transform lacks input type hints, type variables in its output
-    hints cannot bind and default to Any, even when parent composite has
-    decorated type hints.
-    
-    This test demonstrates the current limitation: without explicit input hints
-    on the child, the type variable K in .with_output_types(Tuple[K, str])
-    remains unbound, resulting in Tuple[Any, str] instead of the expected
-    Tuple[str, str].
+    A child transform without input type hints should inherit the ancestor
+    composite's type variable bindings via scope propagation, so TypeVars
+    resolve to concrete types instead of falling back to Any.
     """
     K = typehints.TypeVariable('K')
 
@@ -1488,7 +1483,7 @@ class PTransformTypeCheckTestCase(TypeHintTestCase):
           | beam.Create([('a', 'hello'), ('b', 'world')])
           | TransformWithoutChildHints())
 
-      self.assertEqual(result.element_type, typehints.Tuple[typehints.Any, str])
+      self.assertEqual(result.element_type, typehints.Tuple[str, str])
 
   def test_child_without_output_hints_infers_partial_types_from_dofn(self):
     """
